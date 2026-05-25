@@ -17,8 +17,13 @@ app.use(express.static(path.join(__dirname, '../public')));
 let client = null;
 let clientReady = false;
 let groups = [];
+let linkingMethod = 'qr'; // 'qr' or 'phone'
+let pendingPhoneNumber = null;
 
-function createClient() {
+function createClient(method = 'qr', phoneNumber = null) {
+  linkingMethod = method;
+  pendingPhoneNumber = phoneNumber;
+
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
     puppeteer: {
@@ -36,12 +41,30 @@ function createClient() {
   });
 
   client.on('qr', async (qr) => {
-    try {
-      const qrDataUrl = await qrcode.toDataURL(qr);
-      io.emit('qr', qrDataUrl);
-      io.emit('status', { state: 'qr', message: 'Scan the QR code with WhatsApp' });
-    } catch (err) {
-      console.error('QR error:', err);
+    if (linkingMethod === 'phone' && pendingPhoneNumber) {
+      // Request pairing code instead of showing QR
+      try {
+        const code = await client.requestPairingCode(pendingPhoneNumber);
+        io.emit('pairing_code', code);
+        io.emit('status', { state: 'pairing', message: 'Enter the code in WhatsApp to link' });
+      } catch (err) {
+        io.emit('error', 'Failed to get pairing code: ' + err.message);
+        // Fall back to QR
+        try {
+          const qrDataUrl = await qrcode.toDataURL(qr);
+          io.emit('qr', qrDataUrl);
+          io.emit('status', { state: 'qr', message: 'Pairing code failed — scan QR instead' });
+        } catch (_) {}
+      }
+    } else {
+      // Normal QR flow
+      try {
+        const qrDataUrl = await qrcode.toDataURL(qr);
+        io.emit('qr', qrDataUrl);
+        io.emit('status', { state: 'qr', message: 'Scan the QR code with WhatsApp' });
+      } catch (err) {
+        console.error('QR error:', err);
+      }
     }
   });
 
@@ -61,7 +84,7 @@ function createClient() {
 
   client.on('auth_failure', () => {
     clientReady = false;
-    io.emit('status', { state: 'auth_failure', message: 'Authentication failed. Please refresh and try again.' });
+    io.emit('status', { state: 'auth_failure', message: 'Authentication failed. Please try again.' });
   });
 
   client.on('disconnected', (reason) => {
@@ -93,28 +116,50 @@ async function loadGroups() {
 
 // ─── REST Endpoints ────────────────────────────────────────────────────────────
 
-// Status check
 app.get('/api/status', (req, res) => {
   res.json({ ready: clientReady, groupCount: groups.length });
 });
 
-// Get groups list
 app.get('/api/groups', (req, res) => {
   if (!clientReady) return res.status(503).json({ error: 'Client not ready' });
   res.json(groups);
 });
 
-// Export contacts from selected groups
+// Connect with QR
+app.post('/api/connect/qr', (req, res) => {
+  if (clientReady) return res.json({ ok: true, message: 'Already connected' });
+  if (client) { try { client.destroy(); } catch (_) {} }
+  createClient('qr');
+  res.json({ ok: true, message: 'Starting QR login...' });
+});
+
+// Connect with phone number
+app.post('/api/connect/phone', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+
+  // Sanitize: digits only, with country code
+  const cleaned = phone.replace(/\D/g, '');
+  if (cleaned.length < 10) return res.status(400).json({ error: 'Invalid phone number' });
+
+  if (clientReady) return res.json({ ok: true, message: 'Already connected' });
+  if (client) { try { client.destroy(); } catch (_) {} }
+
+  createClient('phone', cleaned);
+  res.json({ ok: true, message: 'Requesting pairing code...' });
+});
+
+// Export contacts
 app.post('/api/export', async (req, res) => {
   if (!clientReady) return res.status(503).json({ error: 'Client not ready' });
 
-  const { groupIds, format = 'csv' } = req.body;
+  const { groupIds } = req.body;
   if (!groupIds || !Array.isArray(groupIds) || groupIds.length === 0) {
     return res.status(400).json({ error: 'Provide at least one groupId' });
   }
 
   try {
-    const contactMap = new Map(); // keyed by phone to deduplicate
+    const contactMap = new Map();
 
     for (const groupId of groupIds) {
       const chat = await client.getChatById(groupId);
@@ -128,56 +173,39 @@ app.post('/api/export', async (req, res) => {
         const serialized = participant.id._serialized;
 
         if (!contactMap.has(phone)) {
-          // Try to get contact details
-          let name = '';
-          let pushname = '';
+          let name = '', pushname = '';
           try {
             const contact = await client.getContactById(serialized);
             name = contact.name || contact.pushname || '';
             pushname = contact.pushname || '';
-          } catch (_) {
-            // Contact details unavailable — use phone only
-          }
+          } catch (_) {}
 
           contactMap.set(phone, {
             phone: '+' + phone,
-            name: name,
-            pushname: pushname,
+            name,
+            pushname,
             isAdmin: participant.isAdmin ? 'Yes' : 'No',
             isSuperAdmin: participant.isSuperAdmin ? 'Yes' : 'No',
             groups: [groupName]
           });
         } else {
-          // Append group name if contact already seen
           const existing = contactMap.get(phone);
-          if (!existing.groups.includes(groupName)) {
-            existing.groups.push(groupName);
-          }
-          // Update admin status if true in any group
+          if (!existing.groups.includes(groupName)) existing.groups.push(groupName);
           if (participant.isAdmin) existing.isAdmin = 'Yes';
           if (participant.isSuperAdmin) existing.isSuperAdmin = 'Yes';
         }
       }
     }
 
-    const rows = Array.from(contactMap.values()).map(c => ({
-      ...c,
-      groups: c.groups.join(' | ')
-    }));
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'No contacts found in selected groups' });
-    }
+    const rows = Array.from(contactMap.values()).map(c => ({ ...c, groups: c.groups.join(' | ') }));
+    if (rows.length === 0) return res.status(404).json({ error: 'No contacts found' });
 
     const fields = ['phone', 'name', 'pushname', 'isAdmin', 'isSuperAdmin', 'groups'];
-    const parser = new Parser({ fields });
-    const csv = parser.parse(rows);
-
+    const csv = new Parser({ fields }).parse(rows);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const filename = `whatsapp_contacts_${timestamp}.csv`;
 
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="whatsapp_contacts_${timestamp}.csv"`);
     res.send(csv);
 
   } catch (err) {
@@ -186,48 +214,25 @@ app.post('/api/export', async (req, res) => {
   }
 });
 
-// Logout / reset session
+// Logout
 app.post('/api/logout', async (req, res) => {
-  try {
-    if (client) {
-      await client.logout();
-      await client.destroy();
-    }
-  } catch (_) {}
-  client = null;
-  clientReady = false;
-  groups = [];
+  try { if (client) { await client.logout(); await client.destroy(); } } catch (_) {}
+  client = null; clientReady = false; groups = [];
   res.json({ ok: true });
-});
-
-// Reconnect
-app.post('/api/connect', (req, res) => {
-  if (clientReady) return res.json({ ok: true, message: 'Already connected' });
-  createClient();
-  res.json({ ok: true, message: 'Connecting...' });
 });
 
 // ─── Socket.io ─────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-
-  // Send current state to newly connected UI
   if (clientReady) {
     socket.emit('status', { state: 'ready', message: `Connected — ${groups.length} groups loaded` });
     socket.emit('groups', groups);
   } else {
-    socket.emit('status', { state: 'disconnected', message: 'Not connected. Click Connect.' });
+    socket.emit('status', { state: 'disconnected', message: 'Not connected. Choose a login method.' });
   }
-
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-  });
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`\n✅ WhatsApp Contact Exporter running at http://localhost:${PORT}\n`);
-  createClient(); // auto-start on launch
 });
-
